@@ -13,9 +13,10 @@
 //               HS → timken_price_model.dbo.ps_part_hard_cost_master (supplier_id)
 //               All INJA stages matched by supplier_id = GRN.Vendor (SAP vendor code — exact match)
 //
-// Stage: GRN.MaterialDesc LIKE '%-CS-%' → CS  |  '%-HS-%' → HS  |  '%-GS-%' / '%-GS;%' → GS
-// Volume: JSR_Roller_PM.dbo.GRN  (Plant='IN48' or 'INJA', last 12 months)
-// Part ID: GRN.legacy_part_name (matches vw_price_sheet.part_no and ps_*.legacy_part_name)
+// Stage: MaterialDesc LIKE '%-CS-%' → CS  |  '%-HS-%' → HS  |  '%-GS-%' / '%-GS;%' → GS
+//        MaterialDesc LIKE '%Roll%' records excluded from all calculations
+// Volume: JSR_Roller_PM.dbo.vGRN  (Plant='IN48' or 'INJA', last 12 months)
+// Part ID: vGRN.legacy_part_name (matches vw_price_sheet.part_no and ps_*.legacy_part_name)
 
 import { Router } from 'express';
 import { query } from '../db.js';
@@ -45,11 +46,12 @@ function grnCTEs(plantCode) {
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1) AS mo,
       SUM(TRY_CAST(g.ReceivedQty AS float))      AS qty,
       SUM(TRY_CAST(g.[Amount(Inr)] AS float))    AS amount   -- actual invoice value incl. RM
-    FROM JSR_Roller_PM.dbo.GRN g
+    FROM JSR_Roller_PM.dbo.vGRN g
     WHERE g.Plant = '${plantCode}'
       AND g.legacy_part_name IS NOT NULL
       AND g.GRDate >= FORMAT(DATEADD(month, -12, GETDATE()), 'yyyy-MM-dd')
       AND TRY_CAST(g.ReceivedQty AS float) > 0
+      AND g.MaterialDesc NOT LIKE '%Roll%'    -- exclude roller/roll line items
     GROUP BY g.legacy_part_name, g.Vendor, g.VendorName,
       ${GRN_STAGE},
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1)
@@ -623,10 +625,11 @@ r.get('/investigate', async (req, res) => {
         SELECT VendorName AS vendor,
                DATEFROMPARTS(YEAR(TRY_CAST(GRDate AS date)), MONTH(TRY_CAST(GRDate AS date)), 1) AS mo,
                SUM(TRY_CAST(ReceivedQty AS float)) AS qty
-        FROM JSR_Roller_PM.dbo.GRN
+        FROM JSR_Roller_PM.dbo.vGRN
         WHERE Plant = '${plantCode}' AND legacy_part_name = '${safePartNo}'
           AND GRDate >= FORMAT(DATEADD(month,-12,GETDATE()), 'yyyy-MM-dd')
           AND TRY_CAST(ReceivedQty AS float) > 0
+          AND MaterialDesc NOT LIKE '%Roll%'
         GROUP BY VendorName,
                  DATEFROMPARTS(YEAR(TRY_CAST(GRDate AS date)), MONTH(TRY_CAST(GRDate AS date)), 1)
       )
