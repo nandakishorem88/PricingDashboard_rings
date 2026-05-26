@@ -6,13 +6,16 @@
 // /api/exec/investigate    — deep drill-down for one part
 //
 // Price sources:
-//   JSR (IN48): JSR_Rings.dbo.vw_price_sheet
+//   JSR (IN48): JSR_Rings.dbo.vw_price_sheet  (matched by supplier_name = GRN.VendorName)
 //               Stage GS → gs_for_jsr  |  CS → cs_dap_jsr  |  HS → gs_cs_hs_for_jsr
-//   INJA:       timken_price_model.dbo.ps_rings_inja_cost JOIN supplier_master → cost_per_pc
+//   INJA:       GS → timken_price_model.dbo.ps_rings_inja_cost      (process_owner_supplier_id)
+//               CS → timken_price_model.dbo.ps_carb_master           (supplier_id)
+//               HS → timken_price_model.dbo.ps_part_hard_cost_master (supplier_id)
+//               All INJA stages matched by supplier_id = GRN.Vendor (SAP vendor code — exact match)
 //
 // Stage: GRN.MaterialDesc LIKE '%-CS-%' → CS  |  '%-HS-%' → HS  |  '%-GS-%' / '%-GS;%' → GS
 // Volume: JSR_Roller_PM.dbo.GRN  (Plant='IN48' or 'INJA', last 12 months)
-// Part ID: GRN.legacy_part_name (matches vw_price_sheet.part_no and ps_rings_inja_cost.legacy_part_name)
+// Part ID: GRN.legacy_part_name (matches vw_price_sheet.part_no and ps_*.legacy_part_name)
 
 import { Router } from 'express';
 import { query } from '../db.js';
@@ -35,7 +38,9 @@ const GRN_STAGE = `CASE
 function grnCTEs(plantCode) {
   return `
   grnMonth AS (
-    SELECT g.legacy_part_name AS partNo, g.VendorName AS vendor,
+    SELECT g.legacy_part_name AS partNo,
+      g.Vendor      AS vendorId,   -- SAP vendor code = supplier_master.supplier_id
+      g.VendorName  AS vendor,     -- display name
       ${GRN_STAGE} AS stage,
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1) AS mo,
       SUM(TRY_CAST(g.ReceivedQty AS float)) AS qty
@@ -44,14 +49,14 @@ function grnCTEs(plantCode) {
       AND g.legacy_part_name IS NOT NULL
       AND g.GRDate >= FORMAT(DATEADD(month, -12, GETDATE()), 'yyyy-MM-dd')
       AND TRY_CAST(g.ReceivedQty AS float) > 0
-    GROUP BY g.legacy_part_name, g.VendorName,
+    GROUP BY g.legacy_part_name, g.Vendor, g.VendorName,
       ${GRN_STAGE},
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1)
   ),
   grnAgg AS (
-    SELECT partNo, vendor, stage, SUM(qty) AS totalQty, MAX(qty) AS peakMonthQty
+    SELECT partNo, vendorId, vendor, stage, SUM(qty) AS totalQty, MAX(qty) AS peakMonthQty
     FROM grnMonth WHERE stage IS NOT NULL
-    GROUP BY partNo, vendor, stage
+    GROUP BY partNo, vendorId, vendor, stage
   )`;
 }
 
@@ -92,24 +97,86 @@ async function loadJsr() {
 }
 
 async function loadInja() {
+  // Three price sources, one per stage — all matched by supplier_id (GRN.Vendor = SAP vendor code):
+  //   GS → ps_rings_inja_cost        (Forging Cost,     process_owner_supplier_id, template_row_id=1)
+  //   CS → ps_carb_master            (Carburizing Cost, supplier_id, formula: furnace_rate×hours/batch + extras)
+  //   HS → ps_part_hard_cost_master  (Hardening Cost,   supplier_id, hard_cost_per_pc)
+  // Display name taken from GRN.VendorName (g.vendor) — no supplier_master JOIN needed.
   const sql = `
     WITH ${grnCTEs('INJA')},
-    injaPrices AS (
-      SELECT c.legacy_part_name AS partNo, s.supplier_name, c.cost_per_pc,
-        ROW_NUMBER() OVER (
-          PARTITION BY c.legacy_part_name, c.process_owner_supplier_id
-          ORDER BY c.effective_from DESC
-        ) AS rn
+
+    -- GS: Forging cost — keyed by process_owner_supplier_id
+    gsPrices AS (
+      SELECT c.legacy_part_name AS partNo,
+             c.process_owner_supplier_id AS supplierId,
+             c.cost_per_pc,
+             ROW_NUMBER() OVER (
+               PARTITION BY c.legacy_part_name, c.process_owner_supplier_id
+               ORDER BY c.effective_from DESC
+             ) AS rn
       FROM dbo.ps_rings_inja_cost c
-      JOIN dbo.supplier_master s ON s.supplier_id = c.process_owner_supplier_id
-      WHERE c.Plant = 'INJA'
-        AND c.cost_per_pc > 0
+      WHERE c.Plant = 'INJA' AND c.cost_per_pc > 0
         AND c.ps_rings_inja_template_row_id = 1
+    ),
+
+    -- CS: Carburizing cost — keyed by supplier_id (furnace formula)
+    csPrices AS (
+      SELECT c.legacy_part_name AS partNo,
+             c.supplier_id AS supplierId,
+             ROUND(
+               c.furnance_hour_rate * c.cycle_time_in_hours / c.batch_quantity
+               + ISNULL(c.wire_mesh_cost_per_pc,    0)
+               + ISNULL(c.seperator_cost_per_pc,     0)
+               + ISNULL(c.glass_wool_cost_per_pc,    0)
+               + ISNULL(c.tempering_cost_per_pc,     0)
+               + ISNULL(c.screw_cost_per_pc,         0)
+               + ISNULL(c.shot_blasting_cost_per_pc, 0),
+             2) AS cost_per_pc,
+             ROW_NUMBER() OVER (
+               PARTITION BY c.legacy_part_name, c.supplier_id
+               ORDER BY c.effective_from DESC
+             ) AS rn
+      FROM dbo.ps_carb_master c
+      WHERE c.status = 'Approved' AND c.batch_quantity > 0
+    ),
+
+    -- HS: Hardening cost — keyed by supplier_id (direct per-pc rate)
+    hsPrices AS (
+      SELECT h.legacy_part_name AS partNo,
+             h.supplier_id AS supplierId,
+             h.hard_cost_per_pc AS cost_per_pc,
+             ROW_NUMBER() OVER (
+               PARTITION BY h.legacy_part_name, h.supplier_id
+               ORDER BY h.effective_from DESC
+             ) AS rn
+      FROM dbo.ps_part_hard_cost_master h
+      WHERE h.status = 'Approved' AND h.hard_cost_per_pc > 0
     )
+
+    -- GS rows: exact match on supplierId = vendorId (SAP vendor code)
     SELECT g.partNo, g.vendor AS supplierName, g.stage,
            g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
     FROM grnAgg g
-    JOIN injaPrices p ON p.partNo = g.partNo AND p.supplier_name = g.vendor AND p.rn = 1
+    JOIN gsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
+    WHERE g.stage = 'GS' AND p.cost_per_pc > 0
+
+    UNION ALL
+
+    -- CS rows: exact match on supplierId = vendorId
+    SELECT g.partNo, g.vendor AS supplierName, g.stage,
+           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
+    FROM grnAgg g
+    JOIN csPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
+    WHERE g.stage = 'CS' AND p.cost_per_pc > 0
+
+    UNION ALL
+
+    -- HS rows: exact match on supplierId = vendorId
+    SELECT g.partNo, g.vendor AS supplierName, g.stage,
+           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
+    FROM grnAgg g
+    JOIN hsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
+    WHERE g.stage = 'HS' AND p.cost_per_pc > 0
   `;
   const result = await query('inja', sql);
   return result.recordset;
@@ -130,8 +197,16 @@ async function loadPartCounts(plant, loadedRows) {
       totalPriced = cnt.recordset[0]?.n || 0;
     } else {
       const cnt = await query('inja', `
-        SELECT COUNT(DISTINCT legacy_part_name) AS n FROM dbo.ps_rings_inja_cost
-        WHERE Plant = 'INJA' AND cost_per_pc > 0 AND ps_rings_inja_template_row_id = 1
+        SELECT COUNT(DISTINCT legacy_part_name) AS n FROM (
+          SELECT legacy_part_name FROM dbo.ps_rings_inja_cost
+          WHERE Plant = 'INJA' AND cost_per_pc > 0 AND ps_rings_inja_template_row_id = 1
+          UNION
+          SELECT legacy_part_name FROM dbo.ps_carb_master
+          WHERE status = 'Approved' AND batch_quantity > 0
+          UNION
+          SELECT legacy_part_name FROM dbo.ps_part_hard_cost_master
+          WHERE status = 'Approved' AND hard_cost_per_pc > 0
+        ) t
       `);
       totalPriced = cnt.recordset[0]?.n || 0;
     }
