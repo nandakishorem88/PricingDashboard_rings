@@ -43,7 +43,8 @@ function grnCTEs(plantCode) {
       g.VendorName  AS vendor,     -- display name
       ${GRN_STAGE} AS stage,
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1) AS mo,
-      SUM(TRY_CAST(g.ReceivedQty AS float)) AS qty
+      SUM(TRY_CAST(g.ReceivedQty AS float))      AS qty,
+      SUM(TRY_CAST(g.[Amount(Inr)] AS float))    AS amount   -- actual invoice value incl. RM
     FROM JSR_Roller_PM.dbo.GRN g
     WHERE g.Plant = '${plantCode}'
       AND g.legacy_part_name IS NOT NULL
@@ -54,7 +55,9 @@ function grnCTEs(plantCode) {
       DATEFROMPARTS(YEAR(TRY_CAST(g.GRDate AS date)), MONTH(TRY_CAST(g.GRDate AS date)), 1)
   ),
   grnAgg AS (
-    SELECT partNo, vendorId, vendor, stage, SUM(qty) AS totalQty, MAX(qty) AS peakMonthQty
+    SELECT partNo, vendorId, vendor, stage,
+           SUM(qty) AS totalQty, MAX(qty) AS peakMonthQty,
+           SUM(amount) AS totalAmount      -- actual GRN spend (RM + conversion)
     FROM grnMonth WHERE stage IS NOT NULL
     GROUP BY partNo, vendorId, vendor, stage
   )`;
@@ -77,10 +80,10 @@ async function loadJsr() {
       WHERE status IN ('APPROVED', 'DRAFT')
     )
     SELECT sub.partNo, sub.supplierName, sub.stage,
-           sub.totalQty, sub.peakMonthQty, sub.pricePerPc
+           sub.totalQty, sub.peakMonthQty, sub.pricePerPc, sub.totalAmount
     FROM (
       SELECT g.partNo, g.vendor AS supplierName, g.stage,
-             g.totalQty, g.peakMonthQty,
+             g.totalQty, g.peakMonthQty, g.totalAmount,
              CASE g.stage
                WHEN 'GS' THEN p.gs_price
                WHEN 'CS' THEN p.cs_price
@@ -155,7 +158,7 @@ async function loadInja() {
 
     -- GS rows: exact match on supplierId = vendorId (SAP vendor code)
     SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
+           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
     FROM grnAgg g
     JOIN gsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
     WHERE g.stage = 'GS' AND p.cost_per_pc > 0
@@ -164,7 +167,7 @@ async function loadInja() {
 
     -- CS rows: exact match on supplierId = vendorId
     SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
+           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
     FROM grnAgg g
     JOIN csPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
     WHERE g.stage = 'CS' AND p.cost_per_pc > 0
@@ -173,7 +176,7 @@ async function loadInja() {
 
     -- HS rows: exact match on supplierId = vendorId
     SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc
+           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
     FROM grnAgg g
     JOIN hsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
     WHERE g.stage = 'HS' AND p.cost_per_pc > 0
@@ -222,18 +225,19 @@ async function loadPartCounts(plant, loadedRows) {
 function buildByPart(rows) {
   const byPart = {};
   for (const row of rows) {
-    const k     = String(row.partNo);
-    const name  = String(row.supplierName || '(unknown)');
-    const stage = String(row.stage || 'GS').toUpperCase();
-    const price = Number(row.pricePerPc) || 0;
-    const qty   = Number(row.totalQty)   || 0;
-    const peak  = Number(row.peakMonthQty) || 0;
+    const k      = String(row.partNo);
+    const name   = String(row.supplierName || '(unknown)');
+    const stage  = String(row.stage || 'GS').toUpperCase();
+    const price  = Number(row.pricePerPc)   || 0;
+    const qty    = Number(row.totalQty)     || 0;
+    const peak   = Number(row.peakMonthQty) || 0;
+    const amount = Number(row.totalAmount)  || 0;  // actual GRN invoice spend
     if (price <= 0) continue;
     if (!byPart[k]) byPart[k] = { partNo: k, supplierMin: {} };
     const key2 = `${name}::${stage}`;
     const prev = byPart[k].supplierMin[key2];
     if (!prev || price < prev.price) {
-      byPart[k].supplierMin[key2] = { name, price, stage, totalQty: qty, peakMonthQty: peak };
+      byPart[k].supplierMin[key2] = { name, price, stage, totalQty: qty, peakMonthQty: peak, totalAmount: amount };
     }
   }
   return byPart;
@@ -527,12 +531,13 @@ r.get('/optimizer-board', async (req, res) => {
     for (const p of Object.values(byPart)) {
       const stageData = { GS: {}, CS: {}, HS: {} };
 
-      for (const { name, stage, price, totalQty, peakMonthQty } of Object.values(p.supplierMin)) {
+      for (const { name, stage, price, totalQty, peakMonthQty, totalAmount } of Object.values(p.supplierMin)) {
         if (!STAGE_KEYS.includes(stage)) continue;
-        stageData[stage][name] = { price, qty: Math.round(totalQty), peakMonthQty: Math.round(peakMonthQty) };
-        const existing = stageSuppliers[stage].get(name) || { name, baselineQty: 0, totalCapacity: 0 };
+        stageData[stage][name] = { price, qty: Math.round(totalQty), peakMonthQty: Math.round(peakMonthQty), amount: totalAmount || 0 };
+        const existing = stageSuppliers[stage].get(name) || { name, baselineQty: 0, totalCapacity: 0, baselineSpend: 0 };
         existing.baselineQty   += Math.round(totalQty);
         existing.totalCapacity += Math.round(peakMonthQty > 0 ? peakMonthQty * 1.25 * 12 : 0);
+        existing.baselineSpend += totalAmount || 0;
         stageSuppliers[stage].set(name, existing);
       }
 
@@ -544,6 +549,11 @@ r.get('/optimizer-board', async (req, res) => {
         // statusQuoAlloc — actual GRN qty per supplier
         const statusQuoAlloc = Object.fromEntries(
           Object.entries(rates).map(([s, v]) => [s, v.qty])
+        );
+
+        // actualAmountBySup — actual GRN invoice spend per supplier (RM + conversion)
+        const actualAmountBySup = Object.fromEntries(
+          Object.entries(rates).map(([s, v]) => [s, Math.round(v.amount || 0)])
         );
 
         // maxSavingsAlloc — everything to the cheapest supplier
@@ -570,6 +580,7 @@ r.get('/optimizer-board', async (req, res) => {
           partNo: p.partNo, rmGrade: '', rmForm: 'BAR', stageQty,
           rates:            Object.fromEntries(Object.entries(rates).map(([s, v]) => [s, v.price])),
           statusQuoAlloc,
+          actualAmountBySup,
           recommendedAlloc,
           maxSavingsAlloc,
         });

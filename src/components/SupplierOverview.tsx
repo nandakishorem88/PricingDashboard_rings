@@ -25,12 +25,14 @@ export function computeOverview(
       for (const [s, q] of Object.entries(p.statusQuoAlloc)) {
         if (!supplierMap[s]) supplierMap[s] = { name: s, baselineQty: 0, baselineSpend: 0, liveQty: 0, liveSpend: 0 };
         supplierMap[s].baselineQty   += q;
-        supplierMap[s].baselineSpend += q * (p.rates[s] || 0);
+        // Use actual GRN invoice amount when available; fall back to qty × rate
+        supplierMap[s].baselineSpend += p.actualAmountBySup?.[s] ?? q * (p.rates[s] || 0);
       }
       const a = alloc ? (alloc[`${stageKey}::${p.partNo}`] || {}) : p.statusQuoAlloc;
       for (const [s, q] of Object.entries(a)) {
         if (!supplierMap[s]) supplierMap[s] = { name: s, baselineQty: 0, baselineSpend: 0, liveQty: 0, liveSpend: 0 };
         supplierMap[s].liveQty   += q;
+        // Live spend: use price-table rate × allocated qty (forward-looking — no GRN amount for live alloc)
         supplierMap[s].liveSpend += q * (p.rates[s] || 0);
       }
     }

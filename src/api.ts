@@ -154,6 +154,7 @@ export type BoardSupplier = {
   name: string;
   baselineQty: number;
   totalCapacity: number;
+  baselineSpend: number;  // actual GRN invoice spend (RM + conversion)
 };
 export type BoardPart = {
   partNo: string;
@@ -162,6 +163,7 @@ export type BoardPart = {
   stageQty: number;
   rates: Record<string, number>;
   statusQuoAlloc: Record<string, number>;
+  actualAmountBySup: Record<string, number>;  // actual GRN invoice spend per supplier
   recommendedAlloc: Record<string, number>;
   maxSavingsAlloc: Record<string, number>;
 };
