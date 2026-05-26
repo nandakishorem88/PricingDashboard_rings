@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html { font-size: 16px; }
+html, body {
+  background: white;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.tabular-nums { font-variant-numeric: tabular-nums; }
+
+body { color: #0f172a; line-height: 1.55; }
+button, input, select { font-family: inherit; }
+
+@media print {
+  body { font-size: 11pt; }
+  .no-print { display: none !important; }
+  .page-break-avoid { break-inside: avoid; page-break-inside: avoid; }
+  section { break-inside: avoid; page-break-inside: avoid; }
+  .print-tight { padding: 0 !important; margin: 0 !important; }
+  @page { margin: 0.6in; }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "pricing-dashboard-rings",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm run server\" \"npm run web\"",
+    "server": "node server/index.js",
+    "web": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "lucide-react": "^0.563.0",
+    "mssql": "^12.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^3.8.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.24",
+    "concurrently": "^9.1.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.1",
+    "typescript": "~5.3.3",
+    "vite": "^5.0.0"
+  }
+}
