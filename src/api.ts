@@ -248,3 +248,45 @@ export async function fetchInvestigation(plant: PlantKey, partNo: string): Promi
   if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
   return r.json();
 }
+
+// ── GRN Benchmark ──────────────────────────────────────────────────────────────
+export type BenchmarkSupplier = {
+  vendorId: string;
+  vendor: string;
+  totalQty: number;
+  totalAmount: number;
+  effectiveRate: number;
+  isLowest: boolean;
+  savingsPotential: number;
+};
+
+export type BenchmarkPart = {
+  partNo: string;
+  stage: string;
+  supplierCount: number;
+  minRate: number;
+  maxRate: number;
+  spreadPct: number;
+  partTotalQty: number;
+  partTotalAmount: number;
+  totalSavingsPotential: number;
+  suppliers: BenchmarkSupplier[];
+};
+
+export type BenchmarkResponse = {
+  plant: string;
+  generatedAt: string;
+  summary: {
+    partsWithAlternatives: number;
+    totalSavingsPotential: number;
+    suppliersCompared: number;
+    avgSpreadPct: number;
+  };
+  parts: BenchmarkPart[];
+};
+
+export async function fetchGrnBenchmark(plant: PlantKey): Promise<BenchmarkResponse> {
+  const r = await fetch(`/api/exec/grn-benchmark?plant=${plant}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+  return r.json();
+}

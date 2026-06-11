@@ -61,6 +61,10 @@ export function Dashboard({ plant, navigate }: { plant: PlantKey; navigate: (p: 
             className="px-3 py-1.5 text-xs font-semibold bg-indigo-600 text-white rounded-md hover:bg-indigo-700 inline-flex items-center gap-1"
           >🎯 Open Optimizer</button>
           <button
+            onClick={() => navigate(plant === 'inja' ? '/inja/grn-benchmark' : '/jsr/grn-benchmark')}
+            className="px-3 py-1.5 text-xs font-semibold bg-emerald-600 text-white rounded-md hover:bg-emerald-700 inline-flex items-center gap-1"
+          >📊 Benchmark</button>
+          <button
             onClick={() => navigate(otherPlant === 'inja' ? '/inja' : '/jsr')}
             className="px-3 py-1.5 text-xs font-medium bg-white text-slate-700 ring-1 ring-slate-300 rounded-md hover:bg-slate-50"
           >Switch to {otherLabel}</button>

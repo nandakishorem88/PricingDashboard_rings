@@ -4,6 +4,7 @@ import { RingsDeepDive } from './pages/RingsDeepDive';
 import { Dashboard } from './pages/Dashboard';
 import { Optimizer } from './pages/Optimizer';
 import { Investigate } from './pages/Investigate';
+import { GrnBenchmark } from './pages/GrnBenchmark';
 
 export default function App() {
   const { path, navigate } = useRoute();
@@ -15,6 +16,10 @@ export default function App() {
     const plant = (params.get('plant') === 'inja' ? 'inja' : 'jsr') as 'jsr' | 'inja';
     return <Investigate partNo={partNo} plant={plant} navigate={navigate} />;
   }
+
+  // GRN Benchmark
+  if (path === '/jsr/grn-benchmark'  || path === '/jamshedpur/grn-benchmark') return <GrnBenchmark plant="jsr"  navigate={navigate} />;
+  if (path === '/inja/grn-benchmark' || path === '/chennai/grn-benchmark')    return <GrnBenchmark plant="inja" navigate={navigate} />;
 
   // Optimizer drill-downs
   if (path === '/jsr/optimizer'  || path === '/jamshedpur/optimizer') return <Optimizer plant="jsr"  navigate={navigate} />;

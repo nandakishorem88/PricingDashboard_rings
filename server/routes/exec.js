@@ -69,121 +69,31 @@ function grnCTEs(plantCode) {
 // Each returns flat rows: { partNo, supplierName, stage, totalQty, peakMonthQty, pricePerPc }
 // SQL JOIN ensures price > 0 and GRN volume exists — no JS fuzzy-matching needed.
 
-async function loadJsr() {
+// ── GRN-based rate loader ─────────────────────────────────────────────────────
+// Replaces loadJsr() and loadInja().
+// pricePerPc = actual invoiced effective rate = SUM(Amount(Inr)) / SUM(ReceivedQty).
+// 100% GRN coverage — no price sheet dependency.
+// Min 50 pcs per supplier-part-stage to filter noise.
+
+async function loadGrnRates(plantCode, pool) {
   const sql = `
-    WITH ${grnCTEs('IN48')},
-    prices AS (
-      SELECT part_no AS partNo, supplier_name,
-        ISNULL(gs_for_jsr,       0) AS gs_price,
-        ISNULL(cs_dap_jsr,       0) AS cs_price,
-        ISNULL(gs_cs_hs_for_jsr, 0) AS hs_price,
-        ROW_NUMBER() OVER (PARTITION BY part_no, supplier_name ORDER BY computed_at DESC) AS rn
-      FROM dbo.vw_price_sheet
-      WHERE status IN ('APPROVED', 'DRAFT')
-    )
-    SELECT sub.partNo, sub.supplierName, sub.stage,
-           sub.totalQty, sub.peakMonthQty, sub.pricePerPc, sub.totalAmount
-    FROM (
-      SELECT g.partNo, g.vendor AS supplierName, g.stage,
-             g.totalQty, g.peakMonthQty, g.totalAmount,
-             CASE g.stage
-               WHEN 'GS' THEN p.gs_price
-               WHEN 'CS' THEN p.cs_price
-               WHEN 'HS' THEN p.hs_price
-               ELSE 0
-             END AS pricePerPc
-      FROM grnAgg g
-      JOIN prices p ON p.partNo = g.partNo AND p.supplier_name = g.vendor AND p.rn = 1
-    ) sub
-    WHERE sub.pricePerPc > 0
+    WITH ${grnCTEs(plantCode)}
+    SELECT
+      partNo,
+      vendor        AS supplierName,
+      stage,
+      totalQty,
+      peakMonthQty,
+      CASE WHEN totalQty > 0
+           THEN ROUND(totalAmount / totalQty, 2)
+           ELSE 0
+      END           AS pricePerPc,
+      totalAmount
+    FROM grnAgg
+    WHERE totalQty   >= 50
+      AND totalAmount > 0
   `;
-  const result = await query('jsr', sql);
-  return result.recordset;
-}
-
-async function loadInja() {
-  // Three price sources, one per stage — all matched by supplier_id (GRN.Vendor = SAP vendor code):
-  //   GS → ps_rings_inja_cost        (Forging Cost,     process_owner_supplier_id, template_row_id=1)
-  //   CS → ps_carb_master            (Carburizing Cost, supplier_id, formula: furnace_rate×hours/batch + extras)
-  //   HS → ps_part_hard_cost_master  (Hardening Cost,   supplier_id, hard_cost_per_pc)
-  // Display name taken from GRN.VendorName (g.vendor) — no supplier_master JOIN needed.
-  const sql = `
-    WITH ${grnCTEs('INJA')},
-
-    -- GS: Forging cost — keyed by process_owner_supplier_id
-    gsPrices AS (
-      SELECT c.legacy_part_name AS partNo,
-             c.process_owner_supplier_id AS supplierId,
-             c.cost_per_pc,
-             ROW_NUMBER() OVER (
-               PARTITION BY c.legacy_part_name, c.process_owner_supplier_id
-               ORDER BY c.effective_from DESC
-             ) AS rn
-      FROM dbo.ps_rings_inja_cost c
-      WHERE c.Plant = 'INJA' AND c.cost_per_pc > 0
-        AND c.ps_rings_inja_template_row_id = 1
-    ),
-
-    -- CS: Carburizing cost — keyed by supplier_id (furnace formula)
-    csPrices AS (
-      SELECT c.legacy_part_name AS partNo,
-             c.supplier_id AS supplierId,
-             ROUND(
-               c.furnance_hour_rate * c.cycle_time_in_hours / c.batch_quantity
-               + ISNULL(c.wire_mesh_cost_per_pc,    0)
-               + ISNULL(c.seperator_cost_per_pc,     0)
-               + ISNULL(c.glass_wool_cost_per_pc,    0)
-               + ISNULL(c.tempering_cost_per_pc,     0)
-               + ISNULL(c.screw_cost_per_pc,         0)
-               + ISNULL(c.shot_blasting_cost_per_pc, 0),
-             2) AS cost_per_pc,
-             ROW_NUMBER() OVER (
-               PARTITION BY c.legacy_part_name, c.supplier_id
-               ORDER BY c.effective_from DESC
-             ) AS rn
-      FROM dbo.ps_carb_master c
-      WHERE c.status = 'Approved' AND c.batch_quantity > 0
-    ),
-
-    -- HS: Hardening cost — keyed by supplier_id (direct per-pc rate)
-    hsPrices AS (
-      SELECT h.legacy_part_name AS partNo,
-             h.supplier_id AS supplierId,
-             h.hard_cost_per_pc AS cost_per_pc,
-             ROW_NUMBER() OVER (
-               PARTITION BY h.legacy_part_name, h.supplier_id
-               ORDER BY h.effective_from DESC
-             ) AS rn
-      FROM dbo.ps_part_hard_cost_master h
-      WHERE h.status = 'Approved' AND h.hard_cost_per_pc > 0
-    )
-
-    -- GS rows: exact match on supplierId = vendorId (SAP vendor code)
-    SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
-    FROM grnAgg g
-    JOIN gsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
-    WHERE g.stage = 'GS' AND p.cost_per_pc > 0
-
-    UNION ALL
-
-    -- CS rows: exact match on supplierId = vendorId
-    SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
-    FROM grnAgg g
-    JOIN csPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
-    WHERE g.stage = 'CS' AND p.cost_per_pc > 0
-
-    UNION ALL
-
-    -- HS rows: exact match on supplierId = vendorId
-    SELECT g.partNo, g.vendor AS supplierName, g.stage,
-           g.totalQty, g.peakMonthQty, p.cost_per_pc AS pricePerPc, g.totalAmount
-    FROM grnAgg g
-    JOIN hsPrices p ON p.partNo = g.partNo AND p.supplierId = g.vendorId AND p.rn = 1
-    WHERE g.stage = 'HS' AND p.cost_per_pc > 0
-  `;
-  const result = await query('inja', sql);
+  const result = await query(pool, sql);
   return result.recordset;
 }
 
@@ -191,30 +101,22 @@ async function loadInja() {
 
 async function loadPartCounts(plant, loadedRows) {
   const activeSourced = new Set(loadedRows.map(r => r.partNo)).size;
-  let totalPriced = 0;
+  const plantCode = plant === 'inja' ? 'INJA' : 'IN48';
+  let totalPriced = activeSourced;
   try {
-    if (plant === 'jsr') {
-      const cnt = await query('jsr', `
-        SELECT COUNT(DISTINCT part_no) AS n FROM dbo.vw_price_sheet
-        WHERE status IN ('APPROVED','DRAFT')
-          AND (ISNULL(gs_for_jsr,0) > 0 OR ISNULL(cs_dap_jsr,0) > 0 OR ISNULL(gs_cs_hs_for_jsr,0) > 0)
-      `);
-      totalPriced = cnt.recordset[0]?.n || 0;
-    } else {
-      const cnt = await query('inja', `
-        SELECT COUNT(DISTINCT legacy_part_name) AS n FROM (
-          SELECT legacy_part_name FROM dbo.ps_rings_inja_cost
-          WHERE Plant = 'INJA' AND cost_per_pc > 0 AND ps_rings_inja_template_row_id = 1
-          UNION
-          SELECT legacy_part_name FROM dbo.ps_carb_master
-          WHERE status = 'Approved' AND batch_quantity > 0
-          UNION
-          SELECT legacy_part_name FROM dbo.ps_part_hard_cost_master
-          WHERE status = 'Approved' AND hard_cost_per_pc > 0
-        ) t
-      `);
-      totalPriced = cnt.recordset[0]?.n || 0;
-    }
+    // Total unique parts in GRN (unfiltered — no 50pc minimum) for the KPI card
+    const cnt = await query(plant, `
+      SELECT COUNT(DISTINCT legacy_part_name) AS n
+      FROM JSR_Roller_PM.dbo.vGRN
+      WHERE Plant = '${plantCode}'
+        AND legacy_part_name IS NOT NULL
+        AND MaterialDesc NOT LIKE '%Roll%'
+        AND (MaterialDesc LIKE '%-GS-%' OR MaterialDesc LIKE '%-CS-%' OR MaterialDesc LIKE '%-HS-%')
+        AND CAST(GRDate AS DATE) >= DATEADD(month, -12, GETDATE())
+        AND TRY_CAST(ReceivedQty   AS float) > 0
+        AND TRY_CAST([Amount(Inr)] AS float) > 0
+    `);
+    totalPriced = cnt.recordset[0]?.n || activeSourced;
   } catch (e) {
     console.warn(`[exec/counts] ${plant}:`, e.message);
   }
@@ -252,7 +154,7 @@ r.get('/summary', async (req, res) => {
   const plantLabel = plant === 'inja' ? 'Chennai' : 'JSR';
 
   try {
-    const rows       = await (plant === 'jsr' ? loadJsr() : loadInja());
+    const rows       = await loadGrnRates(plant === 'jsr' ? 'IN48' : 'INJA', plant);
     const partCounts = await loadPartCounts(plant, rows);
     const byPart     = buildByPart(rows);
 
@@ -457,7 +359,10 @@ r.get('/summary', async (req, res) => {
 
 r.get('/price-winner', async (_req, res) => {
   try {
-    const [jsrRows, injaRows] = await Promise.all([loadJsr(), loadInja()]);
+    const [jsrRows, injaRows] = await Promise.all([
+      loadGrnRates('IN48', 'jsr'),
+      loadGrnRates('INJA', 'inja'),
+    ]);
 
     function buildPriceWinner(rows, plantLabel) {
       const partMap = {};
@@ -524,7 +429,7 @@ r.get('/optimizer-board', async (req, res) => {
   const tolerance  = Number(req.query.tolerance) || 20;
 
   try {
-    const rows   = await (plant === 'jsr' ? loadJsr() : loadInja());
+    const rows   = await loadGrnRates(plant === 'jsr' ? 'IN48' : 'INJA', plant);
     const byPart = buildByPart(rows);
 
     const stageSuppliers = { GS: new Map(), CS: new Map(), HS: new Map() };
@@ -607,6 +512,134 @@ r.get('/optimizer-board', async (req, res) => {
   }
 });
 
+// ── /grn-benchmark ────────────────────────────────────────────────────────────
+// Compares actual GRN effective rates (Amount÷Qty) across suppliers for each
+// part+stage combo. Only parts with 2+ suppliers are included.
+// No price sheet dependency — 100% GRN-driven.
+
+r.get('/grn-benchmark', async (req, res) => {
+  const plant     = (String(req.query.plant || 'jsr').toLowerCase() === 'inja') ? 'inja' : 'jsr';
+  const plantCode = plant === 'inja' ? 'INJA' : 'IN48';
+  const pool      = plant; // both pools can access JSR_Roller_PM cross-DB
+
+  const sql = `
+    WITH grn AS (
+      SELECT
+        g.legacy_part_name AS partNo,
+        g.Vendor           AS vendorId,
+        g.VendorName       AS vendor,
+        CASE
+          WHEN g.MaterialDesc LIKE '%-CS-%' THEN 'CS'
+          WHEN g.MaterialDesc LIKE '%-HS-%' THEN 'HS'
+          WHEN g.MaterialDesc LIKE '%-GS-%' OR g.MaterialDesc LIKE '%-GS;%' THEN 'GS'
+        END AS stage,
+        SUM(TRY_CAST(g.ReceivedQty    AS float)) AS totalQty,
+        SUM(TRY_CAST(g.[Amount(Inr)]  AS float)) AS totalAmount
+      FROM JSR_Roller_PM.dbo.vGRN g
+      WHERE g.Plant = '${plantCode}'
+        AND g.legacy_part_name IS NOT NULL
+        AND g.MaterialDesc NOT LIKE '%Roll%'
+        AND (g.MaterialDesc LIKE '%-GS-%' OR g.MaterialDesc LIKE '%-CS-%' OR g.MaterialDesc LIKE '%-HS-%')
+        AND CAST(g.GRDate AS DATE) >= DATEADD(month, -12, GETDATE())
+        AND TRY_CAST(g.ReceivedQty   AS float) > 0
+        AND TRY_CAST(g.[Amount(Inr)] AS float) > 0
+      GROUP BY g.legacy_part_name, g.Vendor, g.VendorName,
+        CASE
+          WHEN g.MaterialDesc LIKE '%-CS-%' THEN 'CS'
+          WHEN g.MaterialDesc LIKE '%-HS-%' THEN 'HS'
+          WHEN g.MaterialDesc LIKE '%-GS-%' OR g.MaterialDesc LIKE '%-GS;%' THEN 'GS'
+        END
+    ),
+    rates AS (
+      SELECT *,
+        CASE WHEN totalQty > 0 THEN totalAmount / totalQty ELSE 0 END AS effectiveRate
+      FROM grn
+      WHERE stage IS NOT NULL AND totalQty >= 50
+    ),
+    ranked AS (
+      SELECT r.*,
+        MIN(effectiveRate) OVER (PARTITION BY partNo, stage) AS minRate,
+        MAX(effectiveRate) OVER (PARTITION BY partNo, stage) AS maxRate,
+        COUNT(*)          OVER (PARTITION BY partNo, stage) AS supplierCount,
+        SUM(totalQty)     OVER (PARTITION BY partNo, stage) AS partTotalQty,
+        SUM(totalAmount)  OVER (PARTITION BY partNo, stage) AS partTotalAmount
+      FROM rates r
+    )
+    SELECT
+      partNo, vendorId, vendor, stage,
+      ROUND(totalQty,     0) AS totalQty,
+      ROUND(totalAmount,  0) AS totalAmount,
+      ROUND(effectiveRate,2) AS effectiveRate,
+      ROUND(minRate,      2) AS minRate,
+      ROUND(maxRate,      2) AS maxRate,
+      supplierCount,
+      ROUND(partTotalQty,    0) AS partTotalQty,
+      ROUND(partTotalAmount, 0) AS partTotalAmount,
+      ROUND(CASE WHEN effectiveRate > minRate THEN (effectiveRate - minRate) * totalQty ELSE 0 END, 0) AS savingsPotential
+    FROM ranked
+    WHERE supplierCount >= 2
+    ORDER BY savingsPotential DESC, partNo, stage
+  `;
+
+  try {
+    const rows = (await query(pool, sql)).recordset;
+
+    // Group flat rows → parts with nested supplier arrays
+    const partMap = new Map();
+    for (const row of rows) {
+      const key = `${row.partNo}||${row.stage}`;
+      if (!partMap.has(key)) {
+        partMap.set(key, {
+          partNo:               String(row.partNo),
+          stage:                String(row.stage),
+          supplierCount:        Number(row.supplierCount),
+          minRate:              Number(row.minRate),
+          maxRate:              Number(row.maxRate),
+          spreadPct:            row.minRate > 0 ? +((row.maxRate - row.minRate) / row.minRate * 100).toFixed(1) : 0,
+          partTotalQty:         Math.round(Number(row.partTotalQty)),
+          partTotalAmount:      Math.round(Number(row.partTotalAmount)),
+          totalSavingsPotential: 0,
+          suppliers:            [],
+        });
+      }
+      const part = partMap.get(key);
+      const savings = Math.round(Number(row.savingsPotential) || 0);
+      part.totalSavingsPotential += savings;
+      part.suppliers.push({
+        vendorId:        String(row.vendorId),
+        vendor:          String(row.vendor),
+        totalQty:        Math.round(Number(row.totalQty)),
+        totalAmount:     Math.round(Number(row.totalAmount)),
+        effectiveRate:   Number(row.effectiveRate),
+        isLowest:        Math.abs(Number(row.effectiveRate) - Number(row.minRate)) < 0.01,
+        savingsPotential: savings,
+      });
+    }
+
+    const parts = [...partMap.values()]
+      .sort((a, b) => b.totalSavingsPotential - a.totalSavingsPotential);
+
+    const totalSavingsPotential = parts.reduce((s, p) => s + p.totalSavingsPotential, 0);
+    const totalGrnSpend         = parts.reduce((s, p) => s + p.partTotalAmount, 0) / 2; // avoid double-count (each part counted once)
+    const supplierSet           = new Set(rows.map(r => r.vendor));
+
+    res.json({
+      plant,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        partsWithAlternatives:  parts.length,
+        totalSavingsPotential:  Math.round(totalSavingsPotential),
+        suppliersCompared:      supplierSet.size,
+        avgSpreadPct:           parts.length ? +(parts.reduce((s, p) => s + p.spreadPct, 0) / parts.length).toFixed(1) : 0,
+      },
+      parts,
+    });
+  } catch (e) {
+    console.error('[exec/grn-benchmark]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── /investigate ──────────────────────────────────────────────────────────────
 
 r.get('/investigate', async (req, res) => {
@@ -638,35 +671,48 @@ r.get('/investigate', async (req, res) => {
       FROM monthly GROUP BY vendor ORDER BY totalQty DESC
     `), []);
 
-    // Price lookup — differs by plant
-    const priceP = plant === 'jsr'
-      ? safe(query('jsr', `
-          SELECT supplier_name,
-                 gs_for_jsr, cs_dap_jsr, gs_cs_hs_for_jsr, hs_jw_only,
-                 status, CONVERT(varchar(10), computed_at, 120) AS computed_at
-          FROM dbo.vw_price_sheet
-          WHERE part_no = '${safePartNo}'
-            AND status IN ('APPROVED','DRAFT')
-          ORDER BY supplier_name, computed_at DESC
-        `), [])
-      : safe(query('inja', `
-          SELECT s.supplier_name, c.cost_per_pc,
-                 CONVERT(varchar(10), c.effective_from, 120) AS effective_from
-          FROM dbo.ps_rings_inja_cost c
-          JOIN dbo.supplier_master s ON s.supplier_id = c.process_owner_supplier_id
-          WHERE c.legacy_part_name = '${safePartNo}'
-            AND c.Plant = 'INJA' AND c.cost_per_pc > 0
-            AND c.ps_rings_inja_template_row_id = 1
-          ORDER BY s.supplier_name, c.effective_from DESC
-        `), []);
+    // GRN effective rates — same source as the rest of the app (no price sheet)
+    // effectiveRate = SUM(Amount) / SUM(Qty) per supplier per stage, last 12 months
+    const priceP = safe(query('jsr', `
+      SELECT
+        VendorName AS supplier_name,
+        CASE
+          WHEN MaterialDesc LIKE '%-CS-%' THEN 'CS'
+          WHEN MaterialDesc LIKE '%-HS-%' THEN 'HS'
+          WHEN MaterialDesc LIKE '%-GS-%' OR MaterialDesc LIKE '%-GS;%' THEN 'GS'
+        END AS stage,
+        SUM(TRY_CAST(ReceivedQty   AS float)) AS totalQty,
+        SUM(TRY_CAST([Amount(Inr)] AS float)) AS totalAmount,
+        ROUND(
+          SUM(TRY_CAST([Amount(Inr)] AS float)) /
+          NULLIF(SUM(TRY_CAST(ReceivedQty AS float)), 0),
+        2) AS effective_rate,
+        CONVERT(varchar(10), MAX(TRY_CAST(GRDate AS date)), 23) AS last_grn
+      FROM JSR_Roller_PM.dbo.vGRN
+      WHERE Plant = '${plantCode}'
+        AND legacy_part_name = '${safePartNo}'
+        AND CAST(GRDate AS DATE) >= DATEADD(month, -12, GETDATE())
+        AND MaterialDesc NOT LIKE '%Roll%'
+        AND (MaterialDesc LIKE '%-GS-%' OR MaterialDesc LIKE '%-CS-%' OR MaterialDesc LIKE '%-HS-%')
+        AND TRY_CAST(ReceivedQty   AS float) > 0
+        AND TRY_CAST([Amount(Inr)] AS float) > 0
+      GROUP BY VendorName,
+        CASE
+          WHEN MaterialDesc LIKE '%-CS-%' THEN 'CS'
+          WHEN MaterialDesc LIKE '%-HS-%' THEN 'HS'
+          WHEN MaterialDesc LIKE '%-GS-%' OR MaterialDesc LIKE '%-GS;%' THEN 'GS'
+        END
+      HAVING SUM(TRY_CAST(ReceivedQty AS float)) > 0
+      ORDER BY effective_rate ASC
+    `), []);
 
     const [grnRows, priceRows] = await Promise.all([grnP, priceP]);
 
-    if (!priceRows.recordset.length && !grnRows.recordset.length) {
-      return res.status(404).json({ error: `Part ${partNo} not found` });
+    if (!grnRows.recordset.length) {
+      return res.status(404).json({ error: `Part ${partNo} not found in GRN` });
     }
 
-    // Build quotes array
+    // Build quotes from GRN effective rates
     const quotes = [];
     const nullFields = {
       supplierCode: null, supplierLocation: null, validityStart: null, validityEnd: null,
@@ -678,41 +724,16 @@ r.get('/investigate', async (req, res) => {
       overhead: null, margin: null, transport: null, insurance: null,
     };
 
-    if (plant === 'jsr') {
-      const seen = new Set();
-      for (const row of priceRows.recordset) {
-        if (seen.has(row.supplier_name)) continue;
-        seen.add(row.supplier_name);
-        for (const [stage, col] of [['GS', row.gs_for_jsr], ['CS', row.cs_dap_jsr], ['HS', row.gs_cs_hs_for_jsr]]) {
-          if (!col || Number(col) <= 0) continue;
-          quotes.push({
-            id: `${row.supplier_name}_${stage}`,
-            supplierName: row.supplier_name,
-            quarter: row.computed_at || null,
-            stage,
-            pricePerPc: Number(col),
-            ...nullFields,
-          });
-        }
-      }
-    } else {
-      const seen = new Set();
-      for (const row of priceRows.recordset) {
-        if (seen.has(row.supplier_name)) continue;
-        seen.add(row.supplier_name);
-        quotes.push({
-          id: row.supplier_name,
-          supplierName: row.supplier_name,
-          quarter: row.effective_from || null,
-          stage: 'ALL',
-          pricePerPc: Number(row.cost_per_pc) || 0,
-          ...nullFields,
-        });
-      }
-    }
-
-    if (!quotes.length) {
-      return res.status(404).json({ error: `No price data for part ${partNo} in ${plantCode}` });
+    for (const row of priceRows.recordset) {
+      if (!row.stage || !row.effective_rate) continue;
+      quotes.push({
+        id:           `${row.supplier_name}_${row.stage}`,
+        supplierName: row.supplier_name,
+        quarter:      row.last_grn || null,   // "as of" date
+        stage:        row.stage,
+        pricePerPc:   Number(row.effective_rate) || 0,
+        ...nullFields,
+      });
     }
 
     res.json({
